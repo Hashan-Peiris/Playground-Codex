@@ -3,6 +3,7 @@ import glob
 import os
 import multiprocessing
 import shutil
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -58,11 +59,12 @@ def process_single_outcar(outcar_file, output_dir=OUTPUT_DIR):
     key = int(base_name.split('_')[-1])
 
     npy_temp_dir = os.path.join(output_dir, f"set_temp_{key:03d}")
+    print(f"    Processing {base_name}...")
     outcar_clean = os.path.join(output_dir, f"{outcar_file}_clean")
 
     success = clean_outcar(outcar_file, outcar_clean)
     if not success:
-        print(f"Failed to clean {outcar_file}. Skipping...")
+        print(f"Failed to clean {base_name}. Skipping...")
         return None
 
     try:
@@ -71,6 +73,7 @@ def process_single_outcar(outcar_file, output_dir=OUTPUT_DIR):
             indices = range(0, dsys.get_nframes(), SKIP_INTERVAL)
             dsys = dsys.sub_system(indices)
         dsys.to("deepmd/npy", npy_temp_dir, set_size=dp_batch_size)
+        print(f"    Finished {base_name}")
         return npy_temp_dir
     except Exception as e:
         print(f"Error processing {outcar_file}: {e}")
@@ -81,10 +84,22 @@ def process_all_outcar_files():
     outcar_files = sorted(glob.glob(INPUT_PATTERN), key=lambda x: int(x.split('_')[-1]))
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    if not outcar_files:
+        print(f"No files matching pattern '{INPUT_PATTERN}' found.")
+        return []
+
+    print(f"Found {len(outcar_files)} OUTCAR files to process.")
+
+    temp_dirs = []
     with multiprocessing.Pool(os.cpu_count() or 1) as pool:
-        temp_dirs = pool.map(process_single_outcar, outcar_files)
-    temp_dirs = [r for r in temp_dirs if r]
-    
+        for i, result in enumerate(pool.imap(process_single_outcar, outcar_files), 1):
+            file_name = os.path.basename(outcar_files[i-1])
+            if result:
+                temp_dirs.append(result)
+                print(f"Processed {i}/{len(outcar_files)}: {file_name}")
+            else:
+                print(f"Skipped {i}/{len(outcar_files)}: {file_name}")
+
     return temp_dirs
 
 def flatten_and_merge(temp_dirs, final_dir=FINAL_DIR):
@@ -95,9 +110,12 @@ def flatten_and_merge(temp_dirs, final_dir=FINAL_DIR):
         print("No temporary directories to merge.")
         return
 
+    print(f"Merging {len(temp_dirs)} temporary directories into '{final_dir}'.")
+
     set_counter = 0  # Start numbering from set.000
 
-    for temp_dir in temp_dirs:
+    for t_index, temp_dir in enumerate(temp_dirs, 1):
+        print(f"  Directory {t_index}/{len(temp_dirs)}: {temp_dir}")
         # Collect only subdirectories that match 'set.*'
         set_dirs = sorted(glob.glob(os.path.join(temp_dir, "set.*")))
         for src_dir in set_dirs:
@@ -108,6 +126,8 @@ def flatten_and_merge(temp_dirs, final_dir=FINAL_DIR):
                 dest_item = os.path.join(dest_dir, item)
                 shutil.move(src_item, dest_item)
             set_counter += 1
+
+    print(f"Merged {set_counter} sets into '{final_dir}'.")
 
     # Copy type.raw and type_map.raw (assuming same for all)
     for filename in ["type.raw", "type_map.raw"]:
@@ -202,8 +222,10 @@ def split_data(final_dir=FINAL_DIR, train_ratio=TRAIN_RATIO):
     and visualize the splitting relative to the consecutive trajectory.
     """
     # Load the merged data from deepmd/npy format
+    print(f"Loading merged data from '{final_dir}'...")
     data = dpdata.LabeledSystem(final_dir, fmt="deepmd/npy")
     total_frames = len(data)
+    print(f"Loaded {total_frames} frames. Splitting with train ratio {train_ratio}.")
     
     # Create a random permutation of frame indices
     indices = np.random.permutation(total_frames)
@@ -223,6 +245,7 @@ def split_data(final_dir=FINAL_DIR, train_ratio=TRAIN_RATIO):
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(val_dir, exist_ok=True)
     
+    print("Saving split datasets...")
     data_train.to_deepmd_npy(train_dir, set_size=dp_batch_size)
     data_val.to_deepmd_npy(val_dir, set_size=dp_batch_size)
     
@@ -247,6 +270,10 @@ def split_data(final_dir=FINAL_DIR, train_ratio=TRAIN_RATIO):
 if __name__ == '__main__':
     print("Big Chungus! === Step 1: Processing OUTCAR files ===")
     temp_dirs = process_all_outcar_files()
+
+    if not temp_dirs:
+        print("Big Chungus! No OUTCAR files were processed. Aborting.")
+        sys.exit(1)
 
     print("Big Chungus! === Step 2: Merging into a single deepmd_data directory ===")
     flatten_and_merge(temp_dirs)

@@ -10,6 +10,7 @@ DeepMD-ready training and validation datasets. The script now provides:
 - **Structured logging** to both the console and a log file so that
   multi-process runs remain easy to audit.
 - **Optional cleanup** of intermediate artifacts generated while cleaning and
+  batching the `OUTCAR` inputs, plus an opt-in JSON summary of each run.
   batching the `OUTCAR` inputs.
 
 ### Quick start
@@ -35,6 +36,8 @@ Additional helpful flags:
 | `--visualization-file` | Override the filename used for the split visualization. |
 | `--seed` | Make train/val splitting deterministic. |
 | `--keep-intermediate` | Retain cleaned `OUTCAR` files and temporary DeepMD sets. |
+| `--skip-split` | Finish after merging data without producing train/val sub-sets. |
+| `--summary-file` | Path to a JSON file that captures run metadata and counts. |
 | `--quiet` | Reduce console output to warnings and errors. |
 
 Refer to `python CutTail_dpdata-process_v4.py --help` for the complete list of

@@ -1,11 +1,13 @@
 import argparse
 import dpdata
 import glob
+import json
 import logging
 import multiprocessing
 import os
 import shutil
 import sys
+from datetime import datetime
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -19,6 +21,7 @@ SKIP_INTERVAL = 1             # Use every Nth step
 OUTPUT_DIR = "processed_data"  # Temporary directory for processing
 FINAL_DIR = "deepmd_data"      # Final merged directory
 LOG_FILE = "process_log.txt"
+SUMMARY_FILE = "processing_summary.json"
 dp_batch_size = 512
 TRAIN_RATIO = 0.8             # Ratio for training data (validation = 1 - TRAIN_RATIO)
 VISUALIZATION_FILE = "train_val_split.png"  # Output plot file
@@ -121,6 +124,13 @@ def process_single_outcar(outcar_file):
     if os.path.isdir(npy_temp_dir):
         shutil.rmtree(npy_temp_dir, ignore_errors=True)
 
+
+    if os.path.exists(outcar_clean):
+        os.remove(outcar_clean)
+
+    if os.path.isdir(npy_temp_dir):
+        shutil.rmtree(npy_temp_dir, ignore_errors=True)
+
     success = clean_outcar(outcar_file, outcar_clean, steps_to_remove=settings["steps_to_remove"])
     if not success:
         LOGGER.warning("Failed to clean %s. Skipping...", base_name)
@@ -146,6 +156,7 @@ def process_all_outcar_files():
 
     if not outcar_files:
         LOGGER.warning("No files matching pattern '%s' found.", INPUT_PATTERN)
+        return [], 0
         return []
 
     LOGGER.info("Found %d OUTCAR files to process.", len(outcar_files))
@@ -173,7 +184,7 @@ def process_all_outcar_files():
             else:
                 LOGGER.warning("Skipped %d/%d: %s", i, len(outcar_files), file_name)
 
-    return temp_dirs
+    return temp_dirs, len(outcar_files)
 
 def flatten_and_merge(temp_dirs):
     """Flatten all set.XXX directories into sequentially named set.000, set.001, ..."""
@@ -181,6 +192,7 @@ def flatten_and_merge(temp_dirs):
 
     if not temp_dirs:
         LOGGER.warning("No temporary directories to merge.")
+        return 0
         return
 
     LOGGER.info("Merging %d temporary directories into '%s'.", len(temp_dirs), FINAL_DIR)
@@ -208,6 +220,8 @@ def flatten_and_merge(temp_dirs):
         if os.path.exists(src_file):
             shutil.copy2(src_file, FINAL_DIR)
             LOGGER.info("Copied %s into '%s'.", filename, FINAL_DIR)
+
+    return set_counter
 
 def visualize_split(train_indices, val_indices, total_frames, output_file=None):
     """
@@ -348,6 +362,12 @@ def split_data():
         len(data_val),
     )
 
+    return {
+        "train_frames": len(data_train),
+        "val_frames": len(data_val),
+        "total_frames": total_frames,
+    }
+
 
 def parse_arguments():
     """Parse command line arguments for the processing pipeline."""
@@ -366,10 +386,16 @@ def parse_arguments():
     parser.add_argument("--no-visualization", action="store_true", help="Disable visualization generation.")
     parser.add_argument("--max-workers", type=int, default=None, help="Maximum number of worker processes to spawn.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for deterministic splits.")
+    parser.add_argument("--skip-split", action="store_true", help="Skip the train/validation splitting stage.")
     parser.add_argument(
         "--keep-intermediate",
         action="store_true",
         help="Keep intermediate processed directories instead of deleting them.",
+    )
+    parser.add_argument(
+        "--summary-file",
+        default=SUMMARY_FILE,
+        help="Where to write a JSON summary of the pipeline run.",
     )
     parser.add_argument(
         "--quiet",
@@ -384,6 +410,7 @@ def apply_configuration(args):
     global INPUT_PATTERN, STEPS_TO_REMOVE, SKIP_INTERVAL, OUTPUT_DIR, FINAL_DIR
     global LOG_FILE, dp_batch_size, TRAIN_RATIO, VISUALIZATION_FILE, MAX_WORKERS
     global ENABLE_VISUALIZATION
+    global SUMMARY_FILE
 
     INPUT_PATTERN = args.input_pattern
     STEPS_TO_REMOVE = args.steps_to_remove
@@ -396,6 +423,7 @@ def apply_configuration(args):
     VISUALIZATION_FILE = args.visualization_file
     MAX_WORKERS = args.max_workers
     ENABLE_VISUALIZATION = not args.no_visualization
+    SUMMARY_FILE = args.summary_file
 
     if STEPS_TO_REMOVE < 0:
         raise ValueError("--steps-to-remove must be non-negative.")
@@ -413,6 +441,19 @@ def apply_configuration(args):
         raise ValueError("--max-workers must be a positive integer when provided.")
 
     return args
+
+
+def record_summary(summary_file, summary_payload):
+    """Write a JSON summary of the pipeline run."""
+    directory = os.path.dirname(summary_file)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    with open(summary_file, "w", encoding="utf-8") as handle:
+        json.dump(summary_payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+    LOGGER.info("Wrote pipeline summary to %s", summary_file)
 
 
 def cleanup_intermediate(temp_dirs, keep_intermediate=False):
@@ -451,6 +492,7 @@ def main():
         LOGGER.warning("Intermediate directories will be retained as requested.")
 
     LOGGER.info("Big Chungus! === Step 1: Processing OUTCAR files ===")
+    temp_dirs, total_outcar = process_all_outcar_files()
     temp_dirs = process_all_outcar_files()
 
     if not temp_dirs:
@@ -458,6 +500,38 @@ def main():
         sys.exit(1)
 
     LOGGER.info("Big Chungus! === Step 2: Merging into a single deepmd_data directory ===")
+    merged_sets = flatten_and_merge(temp_dirs)
+
+    split_info = None
+    if args.skip_split:
+        LOGGER.warning("Skipping data split stage as requested.")
+    else:
+        LOGGER.info("Big Chungus! === Step 3: Splitting data into training and validation sets ===")
+        split_info = split_data()
+
+    cleanup_intermediate(temp_dirs, keep_intermediate=args.keep_intermediate)
+    LOGGER.info("Big Chungus! Processing, merging, splitting, and visualization complete.")
+
+    summary_payload = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "input_pattern": INPUT_PATTERN,
+        "steps_to_remove": STEPS_TO_REMOVE,
+        "skip_interval": SKIP_INTERVAL,
+        "batch_size": dp_batch_size,
+        "train_ratio": TRAIN_RATIO,
+        "total_outcar_candidates": total_outcar,
+        "successful_outcar_processes": len(temp_dirs),
+        "merged_sets": merged_sets,
+        "split_performed": split_info is not None,
+        "train_frames": (split_info or {}).get("train_frames"),
+        "val_frames": (split_info or {}).get("val_frames"),
+        "total_frames": (split_info or {}).get("total_frames"),
+        "visualization_enabled": ENABLE_VISUALIZATION,
+        "keep_intermediate": args.keep_intermediate,
+    }
+    record_summary(SUMMARY_FILE, summary_payload)
+
+
     flatten_and_merge(temp_dirs)
 
     LOGGER.info("Big Chungus! === Step 3: Splitting data into training and validation sets ===")

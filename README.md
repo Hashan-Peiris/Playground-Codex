@@ -11,6 +11,7 @@ DeepMD-ready training and validation datasets. The script now provides:
   multi-process runs remain easy to audit.
 - **Optional cleanup** of intermediate artifacts generated while cleaning and
   batching the `OUTCAR` inputs, plus an opt-in JSON summary of each run.
+  batching the `OUTCAR` inputs.
 
 ### Quick start
 

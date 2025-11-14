@@ -124,6 +124,13 @@ def process_single_outcar(outcar_file):
     if os.path.isdir(npy_temp_dir):
         shutil.rmtree(npy_temp_dir, ignore_errors=True)
 
+
+    if os.path.exists(outcar_clean):
+        os.remove(outcar_clean)
+
+    if os.path.isdir(npy_temp_dir):
+        shutil.rmtree(npy_temp_dir, ignore_errors=True)
+
     success = clean_outcar(outcar_file, outcar_clean, steps_to_remove=settings["steps_to_remove"])
     if not success:
         LOGGER.warning("Failed to clean %s. Skipping...", base_name)
@@ -150,6 +157,7 @@ def process_all_outcar_files():
     if not outcar_files:
         LOGGER.warning("No files matching pattern '%s' found.", INPUT_PATTERN)
         return [], 0
+        return []
 
     LOGGER.info("Found %d OUTCAR files to process.", len(outcar_files))
 
@@ -185,6 +193,7 @@ def flatten_and_merge(temp_dirs):
     if not temp_dirs:
         LOGGER.warning("No temporary directories to merge.")
         return 0
+        return
 
     LOGGER.info("Merging %d temporary directories into '%s'.", len(temp_dirs), FINAL_DIR)
 
@@ -484,6 +493,7 @@ def main():
 
     LOGGER.info("Big Chungus! === Step 1: Processing OUTCAR files ===")
     temp_dirs, total_outcar = process_all_outcar_files()
+    temp_dirs = process_all_outcar_files()
 
     if not temp_dirs:
         LOGGER.error("Big Chungus! No OUTCAR files were processed. Aborting.")
@@ -520,6 +530,15 @@ def main():
         "keep_intermediate": args.keep_intermediate,
     }
     record_summary(SUMMARY_FILE, summary_payload)
+
+
+    flatten_and_merge(temp_dirs)
+
+    LOGGER.info("Big Chungus! === Step 3: Splitting data into training and validation sets ===")
+    split_data()
+
+    cleanup_intermediate(temp_dirs, keep_intermediate=args.keep_intermediate)
+    LOGGER.info("Big Chungus! Processing, merging, splitting, and visualization complete.")
 
 
 if __name__ == '__main__':

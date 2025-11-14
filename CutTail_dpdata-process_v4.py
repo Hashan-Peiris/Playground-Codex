@@ -1,9 +1,14 @@
+import argparse
 import dpdata
 import glob
-import os
+import json
+import logging
 import multiprocessing
+import os
 import shutil
 import sys
+from datetime import datetime
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -16,17 +21,60 @@ SKIP_INTERVAL = 1             # Use every Nth step
 OUTPUT_DIR = "processed_data"  # Temporary directory for processing
 FINAL_DIR = "deepmd_data"      # Final merged directory
 LOG_FILE = "process_log.txt"
-dp_batch_size = 512  
+SUMMARY_FILE = "processing_summary.json"
+dp_batch_size = 512
 TRAIN_RATIO = 0.8             # Ratio for training data (validation = 1 - TRAIN_RATIO)
 VISUALIZATION_FILE = "train_val_split.png"  # Output plot file
+MAX_WORKERS = None
+ENABLE_VISUALIZATION = True
+
+LOGGER = logging.getLogger(__name__)
+WORKER_SETTINGS = {}
 # ========================
 
-def clean_outcar(file_in, file_out, steps_to_remove=STEPS_TO_REMOVE):
+def _worker_init(settings):
+    """Initializer for worker processes to receive configuration."""
+    global WORKER_SETTINGS
+    WORKER_SETTINGS = settings
+
+
+def configure_logging(log_file, verbose=True):
+    """Configure logging for both console and file outputs."""
+    log_level = logging.INFO if verbose else logging.WARNING
+    LOGGER.setLevel(log_level)
+
+    # Remove existing handlers to avoid duplication when re-running main.
+    for handler in LOGGER.handlers[:]:
+        LOGGER.removeHandler(handler)
+        handler.close()
+
+    log_dir = os.path.dirname(log_file)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(message)s", "%Y-%m-%d %H:%M:%S"
+    )
+
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(formatter)
+    LOGGER.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(formatter)
+    LOGGER.addHandler(console_handler)
+
+
+def clean_outcar(file_in, file_out, steps_to_remove=None):
     """Clean OUTCAR file by removing the last ``steps_to_remove`` steps.
 
     A ``steps_to_remove`` value of 0 keeps all steps intact. The function
     returns ``True`` if the output file was successfully written.
     """
+    if steps_to_remove is None:
+        steps_to_remove = STEPS_TO_REMOVE
     with open(file_in, "r") as fin:
         lines = fin.readlines()
 
@@ -53,30 +101,45 @@ def clean_outcar(file_in, file_out, steps_to_remove=STEPS_TO_REMOVE):
         fout.writelines(lines[:last_index_to_keep])
     return True
 
-def process_single_outcar(outcar_file, output_dir=OUTPUT_DIR):
+def process_single_outcar(outcar_file):
     """Process a single OUTCAR file to DeepMD format."""
+    settings = WORKER_SETTINGS or {
+        "output_dir": OUTPUT_DIR,
+        "skip_interval": SKIP_INTERVAL,
+        "batch_size": dp_batch_size,
+        "steps_to_remove": STEPS_TO_REMOVE,
+    }
+
     base_name = os.path.basename(outcar_file)
     key = int(base_name.split('_')[-1])
 
+    output_dir = settings["output_dir"]
     npy_temp_dir = os.path.join(output_dir, f"set_temp_{key:03d}")
-    print(f"    Processing {base_name}...")
-    outcar_clean = os.path.join(output_dir, f"{outcar_file}_clean")
+    LOGGER.info("    Processing %s...", base_name)
+    outcar_clean = os.path.join(output_dir, f"{base_name}_clean")
 
-    success = clean_outcar(outcar_file, outcar_clean)
+    if os.path.exists(outcar_clean):
+        os.remove(outcar_clean)
+
+    if os.path.isdir(npy_temp_dir):
+        shutil.rmtree(npy_temp_dir, ignore_errors=True)
+
+    success = clean_outcar(outcar_file, outcar_clean, steps_to_remove=settings["steps_to_remove"])
     if not success:
-        print(f"Failed to clean {base_name}. Skipping...")
+        LOGGER.warning("Failed to clean %s. Skipping...", base_name)
         return None
 
     try:
         dsys = dpdata.LabeledSystem(outcar_clean, fmt="vasp/outcar")
-        if SKIP_INTERVAL > 1:
-            indices = range(0, dsys.get_nframes(), SKIP_INTERVAL)
+        skip_interval = settings["skip_interval"]
+        if skip_interval > 1:
+            indices = range(0, dsys.get_nframes(), skip_interval)
             dsys = dsys.sub_system(indices)
-        dsys.to("deepmd/npy", npy_temp_dir, set_size=dp_batch_size)
-        print(f"    Finished {base_name}")
+        dsys.to("deepmd/npy", npy_temp_dir, set_size=settings["batch_size"])
+        LOGGER.info("    Finished %s", base_name)
         return npy_temp_dir
     except Exception as e:
-        print(f"Error processing {outcar_file}: {e}")
+        LOGGER.error("Error processing %s: %s", outcar_file, e)
         return None
 
 def process_all_outcar_files():
@@ -85,41 +148,54 @@ def process_all_outcar_files():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     if not outcar_files:
-        print(f"No files matching pattern '{INPUT_PATTERN}' found.")
-        return []
+        LOGGER.warning("No files matching pattern '%s' found.", INPUT_PATTERN)
+        return [], 0
 
-    print(f"Found {len(outcar_files)} OUTCAR files to process.")
+    LOGGER.info("Found %d OUTCAR files to process.", len(outcar_files))
 
     temp_dirs = []
-    with multiprocessing.Pool(os.cpu_count() or 1) as pool:
+    worker_count = MAX_WORKERS or (os.cpu_count() or 1)
+    LOGGER.info("Using %d worker(s) for processing.", worker_count)
+
+    settings = {
+        "output_dir": OUTPUT_DIR,
+        "skip_interval": SKIP_INTERVAL,
+        "batch_size": dp_batch_size,
+        "steps_to_remove": STEPS_TO_REMOVE,
+    }
+
+    global WORKER_SETTINGS
+    WORKER_SETTINGS = settings
+
+    with multiprocessing.Pool(worker_count, initializer=_worker_init, initargs=(settings,)) as pool:
         for i, result in enumerate(pool.imap(process_single_outcar, outcar_files), 1):
             file_name = os.path.basename(outcar_files[i-1])
             if result:
                 temp_dirs.append(result)
-                print(f"Processed {i}/{len(outcar_files)}: {file_name}")
+                LOGGER.info("Processed %d/%d: %s", i, len(outcar_files), file_name)
             else:
-                print(f"Skipped {i}/{len(outcar_files)}: {file_name}")
+                LOGGER.warning("Skipped %d/%d: %s", i, len(outcar_files), file_name)
 
-    return temp_dirs
+    return temp_dirs, len(outcar_files)
 
-def flatten_and_merge(temp_dirs, final_dir=FINAL_DIR):
+def flatten_and_merge(temp_dirs):
     """Flatten all set.XXX directories into sequentially named set.000, set.001, ..."""
-    os.makedirs(final_dir, exist_ok=True)
+    os.makedirs(FINAL_DIR, exist_ok=True)
 
     if not temp_dirs:
-        print("No temporary directories to merge.")
-        return
+        LOGGER.warning("No temporary directories to merge.")
+        return 0
 
-    print(f"Merging {len(temp_dirs)} temporary directories into '{final_dir}'.")
+    LOGGER.info("Merging %d temporary directories into '%s'.", len(temp_dirs), FINAL_DIR)
 
     set_counter = 0  # Start numbering from set.000
 
     for t_index, temp_dir in enumerate(temp_dirs, 1):
-        print(f"  Directory {t_index}/{len(temp_dirs)}: {temp_dir}")
+        LOGGER.info("  Directory %d/%d: %s", t_index, len(temp_dirs), temp_dir)
         # Collect only subdirectories that match 'set.*'
         set_dirs = sorted(glob.glob(os.path.join(temp_dir, "set.*")))
         for src_dir in set_dirs:
-            dest_dir = os.path.join(final_dir, f"set.{set_counter:03d}")
+            dest_dir = os.path.join(FINAL_DIR, f"set.{set_counter:03d}")
             os.makedirs(dest_dir, exist_ok=True)
             for item in os.listdir(src_dir):
                 src_item = os.path.join(src_dir, item)
@@ -127,15 +203,18 @@ def flatten_and_merge(temp_dirs, final_dir=FINAL_DIR):
                 shutil.move(src_item, dest_item)
             set_counter += 1
 
-    print(f"Merged {set_counter} sets into '{final_dir}'.")
+    LOGGER.info("Merged %d sets into '%s'.", set_counter, FINAL_DIR)
 
     # Copy type.raw and type_map.raw (assuming same for all)
     for filename in ["type.raw", "type_map.raw"]:
         src_file = os.path.join(temp_dirs[0], filename)
         if os.path.exists(src_file):
-            shutil.copy2(src_file, final_dir)
+            shutil.copy2(src_file, FINAL_DIR)
+            LOGGER.info("Copied %s into '%s'.", filename, FINAL_DIR)
 
-def visualize_split(train_indices, val_indices, total_frames, output_file=VISUALIZATION_FILE):
+    return set_counter
+
+def visualize_split(train_indices, val_indices, total_frames, output_file=None):
     """
     Visualize the train/validation split along the trajectory in two ways:
     1) Scatter with random vertical jitter (top).
@@ -143,7 +222,6 @@ def visualize_split(train_indices, val_indices, total_frames, output_file=VISUAL
 
     A text box displays the number of frames in each split and the total.
     """
-    import matplotlib.pyplot as plt
 
     train_count = len(train_indices)
     val_count = len(val_indices)
@@ -211,74 +289,238 @@ def visualize_split(train_indices, val_indices, total_frames, output_file=VISUAL
 
     # Final layout, save figure
     fig.tight_layout()
+    if output_file is None:
+        output_file = VISUALIZATION_FILE
+
     plt.savefig(output_file)
     plt.close()
 
-    print(f"Visualization saved as {output_file}")
+    LOGGER.info("Visualization saved as %s", output_file)
 
 
-def split_data(final_dir=FINAL_DIR, train_ratio=TRAIN_RATIO):
+def split_data():
     """Randomly split the merged deepmd data into training and validation sets,
     and visualize the splitting relative to the consecutive trajectory.
     """
     # Load the merged data from deepmd/npy format
-    print(f"Loading merged data from '{final_dir}'...")
-    data = dpdata.LabeledSystem(final_dir, fmt="deepmd/npy")
+    LOGGER.info("Loading merged data from '%s'...", FINAL_DIR)
+    data = dpdata.LabeledSystem(FINAL_DIR, fmt="deepmd/npy")
     total_frames = len(data)
-    print(f"Loaded {total_frames} frames. Splitting with train ratio {train_ratio}.")
+    LOGGER.info("Loaded %d frames. Splitting with train ratio %.2f.", total_frames, TRAIN_RATIO)
     
     # Create a random permutation of frame indices
     indices = np.random.permutation(total_frames)
-    n_train = int(total_frames * train_ratio)
+    n_train = int(total_frames * TRAIN_RATIO)
     train_indices = np.sort(indices[:n_train])
     val_indices = np.sort(indices[n_train:])
     
     # Visualize the split
-    visualize_split(train_indices, val_indices, total_frames)
+    if ENABLE_VISUALIZATION:
+        visualize_split(train_indices, val_indices, total_frames)
     
     # Create sub-systems for train and validation data
     data_train = data.sub_system(train_indices)
     data_val = data.sub_system(val_indices)
     
-    train_dir = os.path.join(final_dir, "train")
-    val_dir = os.path.join(final_dir, "val")
+    train_dir = os.path.join(FINAL_DIR, "train")
+    val_dir = os.path.join(FINAL_DIR, "val")
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(val_dir, exist_ok=True)
     
-    print("Saving split datasets...")
+    LOGGER.info("Saving split datasets...")
     data_train.to_deepmd_npy(train_dir, set_size=dp_batch_size)
     data_val.to_deepmd_npy(val_dir, set_size=dp_batch_size)
     
     # Copy type files to the train and val directories if they exist
     for filename in ["type.raw", "type_map.raw"]:
-        src_file = os.path.join(final_dir, filename)
+        src_file = os.path.join(FINAL_DIR, filename)
         if os.path.exists(src_file):
             shutil.copy2(src_file, train_dir)
             shutil.copy2(src_file, val_dir)
     
     # Clean up the original merged content (only keep train/val directories)
-    for item in os.listdir(final_dir):
+    for item in os.listdir(FINAL_DIR):
         if item not in ["train", "val"]:
-            path = os.path.join(final_dir, item)
+            path = os.path.join(FINAL_DIR, item)
             if os.path.isdir(path):
                 shutil.rmtree(path)
             else:
                 os.remove(path)
     
-    print(f"Split data into {len(data_train)} training frames and {len(data_val)} validation frames.")
+    LOGGER.info(
+        "Split data into %d training frames and %d validation frames.",
+        len(data_train),
+        len(data_val),
+    )
 
-if __name__ == '__main__':
-    print("Big Chungus! === Step 1: Processing OUTCAR files ===")
-    temp_dirs = process_all_outcar_files()
+    return {
+        "train_frames": len(data_train),
+        "val_frames": len(data_val),
+        "total_frames": total_frames,
+    }
+
+
+def parse_arguments():
+    """Parse command line arguments for the processing pipeline."""
+    parser = argparse.ArgumentParser(
+        description="Process VASP OUTCAR files into DeepMD datasets with optional splitting."
+    )
+    parser.add_argument("--input-pattern", default=INPUT_PATTERN, help="Glob pattern for OUTCAR files.")
+    parser.add_argument("--steps-to-remove", type=int, default=STEPS_TO_REMOVE, help="Number of final steps to remove from each OUTCAR file.")
+    parser.add_argument("--skip-interval", type=int, default=SKIP_INTERVAL, help="Use every Nth frame when generating data.")
+    parser.add_argument("--output-dir", default=OUTPUT_DIR, help="Temporary directory for intermediate DeepMD data.")
+    parser.add_argument("--final-dir", default=FINAL_DIR, help="Directory that will hold the merged DeepMD data.")
+    parser.add_argument("--log-file", default=LOG_FILE, help="Log file path.")
+    parser.add_argument("--batch-size", type=int, default=dp_batch_size, help="Number of frames per DeepMD set.")
+    parser.add_argument("--train-ratio", type=float, default=TRAIN_RATIO, help="Training split ratio (between 0 and 1).")
+    parser.add_argument("--visualization-file", default=VISUALIZATION_FILE, help="Filename for the train/validation split visualization.")
+    parser.add_argument("--no-visualization", action="store_true", help="Disable visualization generation.")
+    parser.add_argument("--max-workers", type=int, default=None, help="Maximum number of worker processes to spawn.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for deterministic splits.")
+    parser.add_argument("--skip-split", action="store_true", help="Skip the train/validation splitting stage.")
+    parser.add_argument(
+        "--keep-intermediate",
+        action="store_true",
+        help="Keep intermediate processed directories instead of deleting them.",
+    )
+    parser.add_argument(
+        "--summary-file",
+        default=SUMMARY_FILE,
+        help="Where to write a JSON summary of the pipeline run.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Reduce console output to warnings and errors.",
+    )
+    return parser.parse_args()
+
+
+def apply_configuration(args):
+    """Apply parsed arguments to global configuration variables."""
+    global INPUT_PATTERN, STEPS_TO_REMOVE, SKIP_INTERVAL, OUTPUT_DIR, FINAL_DIR
+    global LOG_FILE, dp_batch_size, TRAIN_RATIO, VISUALIZATION_FILE, MAX_WORKERS
+    global ENABLE_VISUALIZATION
+    global SUMMARY_FILE
+
+    INPUT_PATTERN = args.input_pattern
+    STEPS_TO_REMOVE = args.steps_to_remove
+    SKIP_INTERVAL = args.skip_interval
+    OUTPUT_DIR = args.output_dir
+    FINAL_DIR = args.final_dir
+    LOG_FILE = args.log_file
+    dp_batch_size = args.batch_size
+    TRAIN_RATIO = args.train_ratio
+    VISUALIZATION_FILE = args.visualization_file
+    MAX_WORKERS = args.max_workers
+    ENABLE_VISUALIZATION = not args.no_visualization
+    SUMMARY_FILE = args.summary_file
+
+    if STEPS_TO_REMOVE < 0:
+        raise ValueError("--steps-to-remove must be non-negative.")
+
+    if SKIP_INTERVAL <= 0:
+        raise ValueError("--skip-interval must be a positive integer.")
+
+    if dp_batch_size <= 0:
+        raise ValueError("--batch-size must be a positive integer.")
+
+    if not (0.0 < TRAIN_RATIO < 1.0):
+        raise ValueError("--train-ratio must be between 0 and 1 (exclusive).")
+
+    if MAX_WORKERS is not None and MAX_WORKERS <= 0:
+        raise ValueError("--max-workers must be a positive integer when provided.")
+
+    return args
+
+
+def record_summary(summary_file, summary_payload):
+    """Write a JSON summary of the pipeline run."""
+    directory = os.path.dirname(summary_file)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    with open(summary_file, "w", encoding="utf-8") as handle:
+        json.dump(summary_payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+    LOGGER.info("Wrote pipeline summary to %s", summary_file)
+
+
+def cleanup_intermediate(temp_dirs, keep_intermediate=False):
+    """Remove intermediate directories unless retention was requested."""
+    if keep_intermediate:
+        LOGGER.info("Retaining intermediate directories.")
+        return
+
+    for directory in temp_dirs:
+        if os.path.isdir(directory):
+            shutil.rmtree(directory, ignore_errors=True)
+            LOGGER.info("Removed intermediate directory: %s", directory)
+
+    temp_root = os.path.abspath(OUTPUT_DIR)
+    final_root = os.path.abspath(FINAL_DIR)
+
+    if os.path.isdir(temp_root) and temp_root != final_root:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        LOGGER.info("Removed temporary directory tree: %s", temp_root)
+
+def main():
+    args = parse_arguments()
+    configure_logging(args.log_file, verbose=not args.quiet)
+
+    try:
+        apply_configuration(args)
+    except ValueError as exc:
+        LOGGER.error("Configuration error: %s", exc)
+        sys.exit(2)
+
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        LOGGER.info("Random seed set to %d", args.seed)
+
+    if args.keep_intermediate:
+        LOGGER.warning("Intermediate directories will be retained as requested.")
+
+    LOGGER.info("Big Chungus! === Step 1: Processing OUTCAR files ===")
+    temp_dirs, total_outcar = process_all_outcar_files()
 
     if not temp_dirs:
-        print("Big Chungus! No OUTCAR files were processed. Aborting.")
+        LOGGER.error("Big Chungus! No OUTCAR files were processed. Aborting.")
         sys.exit(1)
 
-    print("Big Chungus! === Step 2: Merging into a single deepmd_data directory ===")
-    flatten_and_merge(temp_dirs)
+    LOGGER.info("Big Chungus! === Step 2: Merging into a single deepmd_data directory ===")
+    merged_sets = flatten_and_merge(temp_dirs)
 
-    print("Big Chungus! === Step 3: Splitting data into training and validation sets ===")
-    split_data()
+    split_info = None
+    if args.skip_split:
+        LOGGER.warning("Skipping data split stage as requested.")
+    else:
+        LOGGER.info("Big Chungus! === Step 3: Splitting data into training and validation sets ===")
+        split_info = split_data()
 
-    print("Big Chungus! Processing, merging, splitting, and visualization complete.")
+    cleanup_intermediate(temp_dirs, keep_intermediate=args.keep_intermediate)
+    LOGGER.info("Big Chungus! Processing, merging, splitting, and visualization complete.")
+
+    summary_payload = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "input_pattern": INPUT_PATTERN,
+        "steps_to_remove": STEPS_TO_REMOVE,
+        "skip_interval": SKIP_INTERVAL,
+        "batch_size": dp_batch_size,
+        "train_ratio": TRAIN_RATIO,
+        "total_outcar_candidates": total_outcar,
+        "successful_outcar_processes": len(temp_dirs),
+        "merged_sets": merged_sets,
+        "split_performed": split_info is not None,
+        "train_frames": (split_info or {}).get("train_frames"),
+        "val_frames": (split_info or {}).get("val_frames"),
+        "total_frames": (split_info or {}).get("total_frames"),
+        "visualization_enabled": ENABLE_VISUALIZATION,
+        "keep_intermediate": args.keep_intermediate,
+    }
+    record_summary(SUMMARY_FILE, summary_payload)
+
+
+if __name__ == '__main__':
+    main()
